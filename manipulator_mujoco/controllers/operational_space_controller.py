@@ -7,14 +7,12 @@ from manipulator_mujoco.utils.controller_utils import (
     pose_error,
 )
 
-from manipulator_mujoco.utils.mujoco_utils import (
-    get_site_jac, 
-    get_fullM
-)
+from manipulator_mujoco.utils.mujoco_utils import get_site_jac, get_fullM
 
 from manipulator_mujoco.utils.transform_utils import (
     mat2quat,
 )
+
 
 class OperationalSpaceController(JointEffortController):
     def __init__(
@@ -30,7 +28,7 @@ class OperationalSpaceController(JointEffortController):
         vmax_xyz: float,
         vmax_abg: float,
     ) -> None:
-        
+
         super().__init__(physics, joints, min_effort, max_effort)
 
         self._eef_site = eef_site
@@ -51,21 +49,21 @@ class OperationalSpaceController(JointEffortController):
         self._scale_xyz = vmax_xyz / self._kp * self._kv
         self._scale_abg = vmax_abg / self._ko * self._kv
 
-    def run(self, target):
+    def run(self, target, grip=None):
         # target pose is a 7D vector [x, y, z, qx, qy, qz, qw]
         target_pose = target
 
         # Get the Jacobian matrix for the end-effector.
         J = get_site_jac(
-            self._physics.model.ptr, 
-            self._physics.data.ptr, 
+            self._physics.model.ptr,
+            self._physics.data.ptr,
             self._eef_id,
         )
         J = J[:, self._jnt_dof_ids]
 
         # Get the mass matrix and its inverse for the controlled degrees of freedom (DOF) of the robot.
         M_full = get_fullM(
-            self._physics.model.ptr, 
+            self._physics.model.ptr,
             self._physics.data.ptr,
         )
         M = M_full[self._jnt_dof_ids, :][:, self._jnt_dof_ids]
@@ -90,7 +88,7 @@ class OperationalSpaceController(JointEffortController):
 
         # joint space control signal
         u = np.zeros(self._dof)
-        
+
         # Add the task space control signal to the joint space control signal
         u += np.dot(J.T, np.dot(Mx, u_task))
 
@@ -99,6 +97,19 @@ class OperationalSpaceController(JointEffortController):
 
         # Add gravity compensation to the target effort
         u += self._physics.bind(self._joints).qfrc_bias
+
+        # HACK(dhanush): WidowX gripper control
+        if grip is not None:
+            # NOTE(dhanush): +- order gives open | -+ order gives close
+            grip_torque = 1.0
+            # close
+            if grip == 1:
+                u[-2] = grip_torque
+                u[-1] = -grip_torque
+            # open
+            elif grip == 0:
+                u[-2] = -grip_torque
+                u[-1] = grip_torque
 
         # send the target effort to the joint effort controller
         super().run(u)
@@ -122,4 +133,3 @@ class OperationalSpaceController(JointEffortController):
             scale[3:] *= self._scale_abg / norm_abg
 
         return self._kv * scale * self._lamb * u_task
-
