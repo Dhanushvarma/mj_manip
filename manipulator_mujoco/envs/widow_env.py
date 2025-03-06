@@ -1,9 +1,11 @@
 import time
 import numpy as np
 import os
-import cv2  # Added for OpenCV window rendering
+import cv2
+import mujoco.viewer
 from loguru import logger
 from dm_control import mjcf
+from dm_control.manipulation.shared.constants import RED, GREEN
 import gymnasium as gym
 from gymnasium import spaces
 from manipulator_mujoco.arenas import StandardArena
@@ -20,7 +22,24 @@ class WidowEnv(gym.Env):
         "render_fps": None,  # Set a proper render FPS
     }
 
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, render_backend="mjviewer"):
+        """
+        Initialize the WidowEnv environment.
+
+        Args:
+            render_mode (str, optional): Rendering mode, either "human" or "rgb_array".
+            render_backend (str, optional): Rendering backend, either "cv2" or "mjviewer".
+        """
+        # Validate render_backend
+        assert render_backend in [
+            "cv2",
+            "mjviewer",
+        ], "render_backend must be either 'cv2' or 'mjviewer'"
+        self._render_backend = render_backend
+
+        # set all env relevant constants
+        self._init_consts()
+
         # Observation space with reasonable image dimensions
         self.observation_space = spaces.Dict(
             {
@@ -31,10 +50,16 @@ class WidowEnv(gym.Env):
                     low=-np.inf, high=np.inf, shape=(8,), dtype=np.float64
                 ),  # 8 joint positions
                 "frontview_image": spaces.Box(
-                    low=0, high=255, shape=(1080, 1920, 3), dtype=np.uint8
+                    low=0,
+                    high=255,
+                    shape=(self._image_height, self._image_width, 3),
+                    dtype=np.uint8,
                 ),  # RGB image with useful dimensions
                 "topview_image": spaces.Box(
-                    low=0, high=255, shape=(1080, 1920, 3), dtype=np.uint8
+                    low=0,
+                    high=255,
+                    shape=(self._image_height, self._image_width, 3),
+                    dtype=np.uint8,
                 ),  # RGB image with useful dimensions
             }
         )
@@ -67,30 +92,54 @@ class WidowEnv(gym.Env):
             attachment_site_name="attachment_site",
         )
 
+        # table
+        self._table = Primitive(
+            type="box",
+            size=self._table_dims,
+            pos=[0, 0, self._table_dims[-1]],
+            rgba=[1, 1, 0, 1],
+            friction=[1, 0.3, 0.0001],
+        )
+
         # red box
         self._red_box = Primitive(
             type="box",
-            size=[0.02, 0.02, 0.02],
-            pos=[0, 0, 0.02],
-            rgba=[1, 0, 0, 1],
+            size=[self._cube_prop_size] * 3,
+            pos=[0, 0, self._cube_prop_size],
+            rgba=RED,
             friction=[1, 0.3, 0.0001],
+            mass=0.01,
         )
         self._green_box = Primitive(
             type="box",
-            size=[0.02, 0.02, 0.02],
-            pos=[0, 0, 0.02],
-            rgba=[0, 1, 0, 1],
+            size=[self._cube_prop_size] * 3,
+            pos=[0, 0, self._cube_prop_size],
+            rgba=GREEN,
             friction=[1, 0.3, 0.0001],
+            mass=0.01,
         )
 
-        # attach arm to arena
-        self._arena.attach(self._arm.mjcf_model, pos=[0, 0, 0])
+        # attach arm, table, boxes
+        self._arena.attach(self._arm.mjcf_model, pos=self._robot_root_pose)
+        self._arena.attach(self._table.mjcf_model, pos=self._table_root_pose)
+        self._arena.attach_free(
+            self._red_box.mjcf_model,
+            pos=[
+                self._table_root_pose[0],
+                self._cube_y_offset,
+                2 * self._table_dims[2],
+            ],
+        )
+        self._arena.attach_free(
+            self._green_box.mjcf_model,
+            pos=[
+                self._table_root_pose[0],
+                -self._cube_y_offset,
+                2 * self._table_dims[2],
+            ],
+        )
 
-        # attach boxes to arena as free joint
-        self._arena.attach_free(self._red_box.mjcf_model, pos=[0.15, 0.15, 0])
-        self._arena.attach_free(self._green_box.mjcf_model, pos=[0.15, -0.15, 0])
-
-        # attach cameras to arena
+        # attach cameras
         self._arena.attach_camera(
             name="frontview", pos=[1.15, 0, 0.2125], quat=[0.5, 0.5, 0.5, 0.5]
         )
@@ -102,20 +151,20 @@ class WidowEnv(gym.Env):
         self._physics = mjcf.Physics.from_mjcf_model(self._arena.mjcf_model)
 
         # increase camera buffer size
-        self._physics.model.vis.global_.offwidth = 1920
-        self._physics.model.vis.global_.offheight = 1080
+        self._physics.model.vis.global_.offwidth = self._image_width
+        self._physics.model.vis.global_.offheight = self._image_height
 
         # set up OSC controller with appropriate parameters for Widow Arm
         self._controller = OperationalSpaceController(
             physics=self._physics,
             joints=self._arm.joints,
             eef_site=self._arm.eef_site,
-            min_effort=-50.0,
-            max_effort=50.0,
-            kp=100,
-            ko=100,
-            kv=10,
-            vmax_xyz=0.5,
+            min_effort=-25.0,
+            max_effort=25.0,
+            kp=self._controller_gains["kp"],
+            ko=self._controller_gains["ko"],
+            kv=self._controller_gains["kv"],
+            vmax_xyz=1.0,
             vmax_abg=1.0,
         )
 
@@ -123,17 +172,20 @@ class WidowEnv(gym.Env):
         self._timestep = self._physics.model.opt.timestep
         self._step_start = None
 
-        # Initialize OpenCV window if in human render mode
+        # Initialize rendering backends
         self._cv_window_initialized = False
+        self._viewer = None
+
+        # Initialize the selected rendering backend
         if self._render_mode == "human":
-            cv2.namedWindow("Widow Arm Simulation - Front View", cv2.WINDOW_NORMAL)
-            # cv2.resizeWindow("Widow Arm Simulation - Front View", 1080, 480)
-            cv2.setWindowProperty(
-                "Widow Arm Simulation - Front View",
-                cv2.WND_PROP_FULLSCREEN,
-                cv2.WINDOW_FULLSCREEN,
-            )
-            self._cv_window_initialized = True
+            if self._render_backend == "cv2":
+                cv2.namedWindow("Widow Arm Simulation - Front View", cv2.WINDOW_NORMAL)
+                cv2.setWindowProperty(
+                    "Widow Arm Simulation - Front View",
+                    cv2.WND_PROP_FULLSCREEN,
+                    cv2.WINDOW_FULLSCREEN,
+                )
+                self._cv_window_initialized = True
 
         # Track distances and goal achievement
         self._target_location = np.zeros(3)
@@ -144,6 +196,27 @@ class WidowEnv(gym.Env):
         # Store the current frame for rendering
         self._current_frame = None
 
+    def _init_consts(self):
+        """
+        All constant relevant to setting up the task
+        """
+        self._controller_gains = {"kv": 50, "kp": 200, "ko": 200}
+        self._robot_rest_joint_cfg = [0, 0, 0, 0, 0, 0, 0.015, -0.015]
+
+        self._image_width = 1920
+        self._image_height = 1080
+
+        self._table_dims = [0.15, 0.3, 0.1]
+        self._cube_prop_size = 0.02
+
+        self._robot_root_pose = [0, 0, 0]
+        self._table_root_pose = [0.375, 0, 0]
+
+        self._cube_y_offset = 0.15
+        self._box_spawn_bounds = [0.15, 0.15, 0]  # xyz from root pose
+
+        self._height_off_table = 0.1
+
     def _get_obs(self) -> dict:
         # Get pinch site pose (position and orientation)
         pinch_site_pos = self._physics.bind(self._arm.eef_site).xpos.copy()
@@ -153,13 +226,25 @@ class WidowEnv(gym.Env):
         # Get joint positions
         joint_pose = self._physics.bind(self._arm.joints).qpos.copy()
 
-        # Get camera images with meaningful dimensions
-        frontview_image = self._physics.render(
-            height=1080, width=1920, camera_id="frontview"
-        )
-        topview_image = self._physics.render(
-            height=1080, width=1920, camera_id="topview"
-        )
+        # Get camera images based on the rendering backend
+        if self._render_backend == "mjviewer" and self._render_mode == "human":
+            # Use zeros trick to avoid conflict with MuJoCo viewer
+            frontview_image = np.zeros(
+                (self._image_height, self._image_width, 3), dtype=np.uint8
+            )
+            topview_image = np.zeros(
+                (self._image_height, self._image_width, 3), dtype=np.uint8
+            )
+        else:
+            # Render actual camera images
+            frontview_image = self._physics.render(
+                height=self._image_height,
+                width=self._image_width,
+                camera_id="frontview",
+            )
+            topview_image = self._physics.render(
+                height=self._image_height, width=self._image_width, camera_id="topview"
+            )
 
         # Store the frontview image for rendering
         self._current_frame = frontview_image
@@ -173,24 +258,23 @@ class WidowEnv(gym.Env):
 
     def _get_info(self) -> dict:
         # Provide useful information for debugging and monitoring
-        if False:
-            info = {
-                "distance_to_target": self._current_distance,
-                "goal_achieved": self._goal_achieved,
-                "red_box_pos": self._physics.bind(
-                    self._red_box.mjcf_model.find_all("geom")[0]
-                ).pos.copy(),
-                "green_box_pos": self._physics.bind(
-                    self._green_box.mjcf_model.find_all("geom")[0]
-                ).pos.copy(),
-                "ee_position": self._physics.bind(self._arm.eef_site).xpos.copy(),
-            }
-        return {}
+        info = {
+            "distance_to_target": self._current_distance,
+            "goal_achieved": self._goal_achieved,
+            "red_box_pos": self._physics.bind(
+                self._red_box.mjcf_model.find_all("geom")[0]
+            ).pos.copy(),
+            "green_box_pos": self._physics.bind(
+                self._green_box.mjcf_model.find_all("geom")[0]
+            ).pos.copy(),
+            "ee_position": self._physics.bind(self._arm.eef_site).xpos.copy(),
+        }
+        return info
 
     def reset(self, seed=None, options=None) -> tuple:
         super().reset(seed=seed)
 
-        print("Reset is occuring !")
+        print("Reset is occurring!")
 
         # Use the seed for randomization
         self.np_random = np.random.RandomState(seed)
@@ -198,34 +282,36 @@ class WidowEnv(gym.Env):
         # reset physics
         with self._physics.reset_context():
             # put arm in a reasonable starting position
-            self._physics.bind(self._arm.joints).qpos = [
-                0,
-                -0.96,
-                1.16,
-                0,
-                -0.3,
-                0,
-                0.015,
-                -0.015,
-            ]
+            self._physics.bind(self._arm.joints).qpos = self._robot_rest_joint_cfg
 
             # randomize box positions
             red_box_pos = [
-                self.np_random.uniform(0.10, 0.20),
-                self.np_random.uniform(0.10, 0.20),
-                0.02,
+                self.np_random.uniform(
+                    self._table_root_pose[0] - self._box_spawn_bounds[0],
+                    self._table_root_pose[0] + self._box_spawn_bounds[0],
+                ),
+                self.np_random.uniform(
+                    self._cube_y_offset - self._box_spawn_bounds[1],
+                    self._cube_y_offset + self._box_spawn_bounds[1],
+                ),
+                2 * self._table_dims[2],
             ]
             green_box_pos = [
-                self.np_random.uniform(0.10, 0.20),
-                self.np_random.uniform(-0.10, -0.20),
-                0.02,
+                self.np_random.uniform(
+                    self._table_root_pose[0] - self._box_spawn_bounds[0],
+                    self._table_root_pose[0] + self._box_spawn_bounds[0],
+                ),
+                self.np_random.uniform(
+                    -self._cube_y_offset - self._box_spawn_bounds[1],
+                    -self._cube_y_offset + self._box_spawn_bounds[1],
+                ),
+                2 * self._table_dims[2],
             ]
             self._physics.bind(self._red_box.geom).xpos = red_box_pos
             self._physics.bind(self._green_box.geom).xpos = green_box_pos
 
-            # put target in a reasonable starting position
+            # TODO: change to fk solution of the arm reset joint configuration
             target_pos = [0.5, 0, 0.1]  # Raised z position for better visibility
-
             self._target.set_mocap_pose(
                 self._physics, position=target_pos, quaternion=[1, 0, 0, 0]
             )
@@ -244,18 +330,16 @@ class WidowEnv(gym.Env):
         # Reset goal achievement status
         self._goal_achieved = False
 
-        if False:
-            # Render the initial state if in human mode
-            if self._render_mode == "human":
-                self._render_frame()
+        # Render the initial state if in human mode
+        if self._render_mode == "human":
+            self._render_frame()
 
         info = self._get_info()
 
         return observation, info
 
     def step(self, action: np.ndarray) -> tuple:
-
-        # hack: to access sep
+        # hack: to access grip
         grip = action[-1]
         action = action[0]
 
@@ -334,21 +418,37 @@ class WidowEnv(gym.Env):
 
     def _render_frame(self) -> None:
         """
-        Renders the current frame using OpenCV if the render mode is set to "human".
+        Renders the current frame using the selected backend if the render mode is set to "human".
         """
-        if self._render_mode != "human" or self._current_frame is None:
+        if self._render_mode != "human":
             return
 
         # Initialize step timer if needed
         if self._step_start is None:
             self._step_start = time.time()
 
-        # Convert RGB to BGR for OpenCV
-        frame_bgr = cv2.cvtColor(self._current_frame, cv2.COLOR_RGB2BGR)
+        # Render using the selected backend
+        if self._render_backend == "cv2":
+            if self._current_frame is None:
+                return
 
-        # Display the frame
-        cv2.imshow("Widow Arm Simulation - Front View", frame_bgr)
-        cv2.waitKey(1)  # Required for OpenCV to update the window
+            # Convert RGB to BGR for OpenCV
+            frame_bgr = cv2.cvtColor(self._current_frame, cv2.COLOR_RGB2BGR)
+
+            # Display the frame
+            cv2.imshow("Widow Arm Simulation - Front View", frame_bgr)
+            cv2.waitKey(1)  # Required for OpenCV to update the window
+
+        elif self._render_backend == "mjviewer":
+            if self._viewer is None:
+                # Launch MuJoCo viewer
+                self._viewer = mujoco.viewer.launch_passive(
+                    self._physics.model.ptr,
+                    self._physics.data.ptr,
+                )
+
+            # Render viewer
+            self._viewer.sync()
 
         # Maintain consistent frame rate
         time_until_next_step = self._timestep - (time.time() - self._step_start)
@@ -359,8 +459,11 @@ class WidowEnv(gym.Env):
 
     def close(self) -> None:
         """
-        Closes the OpenCV window if it's open.
+        Closes the rendering backend.
         """
-        if self._cv_window_initialized:
+        if self._render_backend == "cv2" and self._cv_window_initialized:
             cv2.destroyWindow("Widow Arm Simulation - Front View")
             self._cv_window_initialized = False
+        elif self._render_backend == "mjviewer" and self._viewer is not None:
+            self._viewer.close()
+            self._viewer = None
