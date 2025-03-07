@@ -1,18 +1,22 @@
 import time
-import numpy as np
 import os
+
+import numpy as np
 import cv2
-import mujoco.viewer
 from loguru import logger
-from dm_control import mjcf
-from dm_control.manipulation.shared.constants import RED, GREEN
 import gymnasium as gym
 from gymnasium import spaces
+
+import mujoco.viewer
+from dm_control import mjcf
+from dm_control.manipulation.shared.constants import RED, GREEN
+
 from manipulator_mujoco.arenas import StandardArena
 from manipulator_mujoco.robots import Arm
 from manipulator_mujoco.props import Primitive
 from manipulator_mujoco.mocaps import Target
 from manipulator_mujoco.controllers import OperationalSpaceController
+from manipulator_mujoco.utils.consts import RED, GREEN
 
 
 class WidowEnv(gym.Env):
@@ -187,35 +191,36 @@ class WidowEnv(gym.Env):
                 )
                 self._cv_window_initialized = True
 
-        # Track distances and goal achievement
-        self._target_location = np.zeros(3)
-        self._current_distance = None
-        self._prev_distance = None
-        self._goal_achieved = False
-
         # Store the current frame for rendering
         self._current_frame = None
+
+        # Track task completion
+        self._task_success = False
 
     def _init_consts(self):
         """
         All constant relevant to setting up the task
         """
         self._controller_gains = {"kv": 50, "kp": 200, "ko": 200}
-        self._robot_rest_joint_cfg = [0, 0, 0, 0, 0, 0, 0.015, -0.015]
+        self._robot_rest_joint_cfg = [0, 0, 0, 0, +1.5708, 0, 0.015, -0.015]
 
-        self._image_width = 1920
-        self._image_height = 1080
+        self._image_width = 300
+        self._image_height = 300
 
-        self._table_dims = [0.15, 0.3, 0.1]
-        self._cube_prop_size = 0.02
+        self._table_dims = [0.15, 0.3, 0.075]
+        self._cube_prop_size = 0.015
 
         self._robot_root_pose = [0, 0, 0]
-        self._table_root_pose = [0.375, 0, 0]
+        self._table_root_pose = [0.325, 0, 0]
 
         self._cube_y_offset = 0.15
-        self._box_spawn_bounds = [0.15, 0.15, 0]  # xyz from root pose
+        self._box_spawn_bounds = [0.20, 0.20, 0]  # xyz from root pose
 
-        self._height_off_table = 0.1
+        # Define the height threshold for successful block lifting
+        self._lift_height_threshold = 0.08  # 5cm above table surface
+
+        # Table top surface height from ground
+        self._table_top_height = self._table_dims[-1] * 2
 
     def _get_obs(self) -> dict:
         # Get pinch site pose (position and orientation)
@@ -257,16 +262,27 @@ class WidowEnv(gym.Env):
         }
 
     def _get_info(self) -> dict:
+        # Get block positions
+        red_box_pos = self._physics.bind(self._red_box.geom).xpos.copy()
+        green_box_pos = self._physics.bind(self._green_box.geom).xpos.copy()
+
+        # Calculate height above table
+        red_box_height_above_table = red_box_pos[2] - self._table_top_height
+        green_box_height_above_table = green_box_pos[2] - self._table_top_height
+
+        # Check if either block is above threshold
+        red_box_lifted = red_box_height_above_table > self._lift_height_threshold
+        green_box_lifted = green_box_height_above_table > self._lift_height_threshold
+
         # Provide useful information for debugging and monitoring
         info = {
-            "distance_to_target": self._current_distance,
-            "goal_achieved": self._goal_achieved,
-            "red_box_pos": self._physics.bind(
-                self._red_box.mjcf_model.find_all("geom")[0]
-            ).pos.copy(),
-            "green_box_pos": self._physics.bind(
-                self._green_box.mjcf_model.find_all("geom")[0]
-            ).pos.copy(),
+            "red_box_pos": red_box_pos,
+            "green_box_pos": green_box_pos,
+            "red_box_height_above_table": red_box_height_above_table,
+            "green_box_height_above_table": green_box_height_above_table,
+            "red_box_lifted": red_box_lifted,
+            "green_box_lifted": green_box_lifted,
+            "task_success": self._task_success,
             "ee_position": self._physics.bind(self._arm.eef_site).xpos.copy(),
         }
         return info
@@ -310,25 +326,19 @@ class WidowEnv(gym.Env):
             self._physics.bind(self._red_box.geom).xpos = red_box_pos
             self._physics.bind(self._green_box.geom).xpos = green_box_pos
 
-            # TODO: change to fk solution of the arm reset joint configuration
-            target_pos = [0.5, 0, 0.1]  # Raised z position for better visibility
+            # Set target position above table
+            target_pos = [0.5, 0, self._table_top_height + 0.1]
             self._target.set_mocap_pose(
-                self._physics, position=target_pos, quaternion=[1, 0, 0, 0]
+                self._physics,
+                position=target_pos,
+                quaternion=[0.7071068, 0, 0.7071068, 0],  # Y = 90 degrees
             )
 
-            # Store target location for reward calculation
-            self._target_location = target_pos
+        # Reset task success flag
+        self._task_success = False
 
         # Get initial observation
         observation = self._get_obs()
-
-        # Calculate initial distance to target
-        ee_pos = observation["pinch_site_pose"][:3]
-        self._current_distance = np.linalg.norm(ee_pos - self._target_location)
-        self._prev_distance = self._current_distance
-
-        # Reset goal achievement status
-        self._goal_achieved = False
 
         # Render the initial state if in human mode
         if self._render_mode == "human":
@@ -338,21 +348,31 @@ class WidowEnv(gym.Env):
 
         return observation, info
 
-    def step(self, action: np.ndarray) -> tuple:
-        # hack: to access grip
-        grip = action[-1]
-        action = action[0]
+    def step(self, action) -> tuple:
+        # Unpack the action tuple - continuous and discrete parts
+        continuous_action, grip = action
 
         # Use the action to update the target pose
-        current_ee_pos = self._physics.bind(self._arm.eef_site).xpos.copy()
-        current_ee_quat = self._physics.bind(self._arm.eef_site).quat.copy()
+        current_ee_pos = self._physics.bind(
+            self._arm.eef_site
+        ).xpos.copy()  # updating fine
+        current_ee_quat = self._physics.bind(
+            self._arm.eef_site
+        ).quat.copy()  # FIXME : why always [1, 0, 0, 0] ?
 
         # Update position target based on action (dx, dy, dz)
-        new_target_pos = current_ee_pos + action[:3]
+        new_target_pos = current_ee_pos + continuous_action[:3]
 
-        # TODO: use angle input to update target
+        # Clamp to reasonable workspace
+        new_target_pos = np.clip(
+            new_target_pos,
+            [0.1, -0.5, 0.02],  # Lower bounds
+            [0.7, 0.5, 0.5],  # Upper bounds
+        )
 
-        # TODO: clamp to workspace limits
+        print("Current EE Pos: ", current_ee_pos)  # debug
+        print("Current EE Quat: ", current_ee_quat)  # debug
+        current_ee_quat = [0.7071068, 0, 0.7071068, 0]  # HACK
 
         # Update the mocap target pose
         self._target.set_mocap_pose(
@@ -368,36 +388,20 @@ class WidowEnv(gym.Env):
         # Step physics
         self._physics.step()
 
-        # Calculate distance to target location (e.g., red box)
-        current_ee_pos = self._physics.bind(self._arm.eef_site).xpos.copy()
-        self._prev_distance = self._current_distance
-        self._current_distance = np.linalg.norm(current_ee_pos - self._target_location)
-
-        # Check if we've reached the target
-        goal_threshold = 0.02  # 2cm threshold
-        self._goal_achieved = self._current_distance < goal_threshold
-
-        ############################ Reward Computation
-        # 1. Reward for decreasing distance to target
-        distance_improvement = self._prev_distance - self._current_distance
-        distance_reward = 10.0 * distance_improvement
-
-        # 2. Bonus for reaching target
-        goal_reward = 100.0 if self._goal_achieved else 0.0
-
-        # 3. Small penalty for excessive movement (encourage smooth trajectories)
-        action_penalty = -0.1 * np.sum(np.square(action))
-
-        # Total reward
-        reward = distance_reward + goal_reward + action_penalty
-        ############################
-
-        # Termination conditions
-        terminated = False
-
-        # Get observation and info
-        observation = self._get_obs()
+        # Get block positions and check if lifted
         info = self._get_info()
+
+        # Task is successful if either block is lifted above threshold
+        self._task_success = info["red_box_lifted"] or info["green_box_lifted"]
+
+        # Binary reward: 1 for success, 0 otherwise
+        reward = 1.0 if self._task_success else 0.0
+
+        # Terminate episode if task is successful
+        terminated = self._task_success
+
+        # Get observation
+        observation = self._get_obs()
 
         # Render frame if in human mode
         if self._render_mode == "human":

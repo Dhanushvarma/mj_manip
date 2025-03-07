@@ -1,5 +1,6 @@
 import numpy as np
 
+
 class Target(object):
     """
     A class representing a pool cue with motion capture capabilities.
@@ -55,21 +56,15 @@ class Target(object):
             quaternion: The quaternion orientation of the mocap body.
         """
 
-        # flip quaternion xyzw to wxyz
-        quaternion = np.roll(np.array(quaternion), 1)
-
         if position is not None:
             physics.bind(self.mocap).mocap_pos[:] = position
         if quaternion is not None:
             physics.bind(self.mocap).mocap_quat[:] = quaternion
 
     def get_mocap_pose(self, physics):
-        
+
         position = physics.bind(self.mocap).mocap_pos[:]
         quaternion = physics.bind(self.mocap).mocap_quat[:]
-
-        # flip quaternion wxyz to xyzw
-        quaternion = np.roll(np.array(quaternion), -1)
 
         pose = np.concatenate([position, quaternion])
 

@@ -50,8 +50,9 @@ class OperationalSpaceController(JointEffortController):
         self._scale_abg = vmax_abg / self._ko * self._kv
 
     def run(self, target, grip=None):
-        # target pose is a 7D vector [x, y, z, qx, qy, qz, qw]
-        target_pose = target
+
+        #  is a 7D vector [x, y, z, qx, qy, qz, qw]
+        target_pose = target[[0, 1, 2, 4, 5, 6, 3]]
 
         # Get the Jacobian matrix for the end-effector.
         J = get_site_jac(
@@ -102,12 +103,12 @@ class OperationalSpaceController(JointEffortController):
         if grip is not None:
             # NOTE(dhanush): +- order gives open | -+ order gives close
             grip_torque = 1.0
-            # close
-            if grip == 1:
+            # open
+            if grip == 0:
                 u[-2] = grip_torque
                 u[-1] = -grip_torque
-            # open
-            elif grip == 0:
+            # close
+            elif grip == 1:
                 u[-2] = -grip_torque
                 u[-1] = grip_torque
 
